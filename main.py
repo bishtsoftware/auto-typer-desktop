@@ -32,6 +32,9 @@ from pynput.keyboard import Controller, Key
 
 APP_TITLE = "AutoTyper"
 
+# Characters that need explicit Key.* events rather than controller.type()
+_SPECIAL = frozenset({"\n", "\t", "\r"})
+
 
 class HotkeyBridge(QObject):
     start = pyqtSignal()
@@ -113,21 +116,35 @@ class TypingWorker(QObject):
             time.sleep(min(0.03, max(0.0, remaining)))
         return not self.stop_event.is_set()
 
-    def _tap(self, key_or_char):
-        if key_or_char == "\n":
+    def _check(self) -> bool:
+        """Return True if typing should continue (not stopped or paused)."""
+        if self.stop_event.is_set():
+            return False
+        if self.pause_event.is_set():
+            return self._wait_while_paused()
+        return True
+
+    def _tap_special(self, ch: str) -> None:
+        """
+        Send a non-printable key (newline, tab) via explicit Key.* events.
+
+        A short sleep after Enter/Tab is intentional: most IDEs and editors
+        react to Enter with auto-indent or bracket insertion, and the next
+        character must wait for that to finish or it lands in the wrong place.
+        """
+        if ch == "\n":
             self.controller.press(Key.enter)
             self.controller.release(Key.enter)
-        elif key_or_char == "\t":
+            time.sleep(0.012)        # let the target app settle (auto-indent, etc.)
+        elif ch == "\t":
             self.controller.press(Key.tab)
             self.controller.release(Key.tab)
-        elif key_or_char == "\r":
-            pass
-        else:
-            self.controller.press(key_or_char)
-            self.controller.release(key_or_char)
+            time.sleep(0.006)
+        # "\r" — intentionally a no-op; the paired "\n" handles the line break
 
     def run(self):
         try:
+            # ── Countdown ─────────────────────────────────────────────────────
             if self.cfg.countdown > 0:
                 for remaining in range(self.cfg.countdown, 0, -1):
                     if self.stop_event.is_set():
@@ -150,51 +167,88 @@ class TypingWorker(QObject):
             wpm = max(1, int(self.cfg.wpm))
             cps = max(0.1, (wpm * 5.0) / 60.0)
             turbo = wpm >= 1000
-            chunk_size = 1
-            if turbo:
-                chunk_size = max(8, min(32, wpm // 80))
 
             self.status.emit("Turbo burst" if turbo else "Typing...")
             typed = 0
-            sleep_accum = 0
-            chunk_delay = chunk_size / cps if turbo else 1.0 / cps
 
-            for ch in text:
-                if self.stop_event.is_set():
-                    self.status.emit("Stopped")
-                    self.finished.emit(False)
-                    return
+            if turbo:
+                # ── Turbo mode ────────────────────────────────────────────────
+                # Batch consecutive printable chars into a single controller.type()
+                # call, then pause for a proportional delay.  Special chars
+                # (newline, tab) always flush the current batch and are sent as
+                # explicit key events so modifiers and app reactions work correctly.
+                chunk_size = max(8, min(32, wpm // 80))
+                i = 0
 
-                if not self._wait_while_paused():
-                    self.status.emit("Stopped")
-                    self.finished.emit(False)
-                    return
+                while i < len(text):
+                    if not self._check():
+                        self.status.emit("Stopped")
+                        self.finished.emit(False)
+                        return
 
-                self._tap(ch)
-                typed += 1
-                sleep_accum += 1
+                    # Collect up to chunk_size consecutive printable characters
+                    j = i
+                    while j < len(text) and (j - i) < chunk_size and text[j] not in _SPECIAL:
+                        j += 1
 
-                if turbo:
-                    if sleep_accum >= chunk_size:
-                        delay = chunk_delay * random.uniform(0.82, 1.10)
+                    if j > i:
+                        chunk = text[i:j]
+                        # controller.type() is the correct pynput API for typing
+                        # printable text.  Unlike controller.press(char), it
+                        # automatically applies the shift modifier for uppercase,
+                        # punctuation, and every character that needs it — so
+                        # spaces, {, (, !, ", etc. all arrive correctly.
+                        self.controller.type(chunk)
+                        typed += len(chunk)
+                        i = j
+
+                        delay = (len(chunk) / cps) * random.uniform(0.82, 1.10)
                         if not self._sleep_interruptible(delay):
                             self.status.emit("Stopped")
                             self.finished.emit(False)
                             return
-                        sleep_accum = 0
-                else:
-                    delay = chunk_delay * random.uniform(0.90, 1.12)
+
+                    # Handle one special character if that's what stopped the run
+                    if i < len(text) and text[i] in _SPECIAL:
+                        self._tap_special(text[i])
+                        typed += 1
+                        i += 1
+
+                    if typed % 50 == 0:
+                        self._emit_stats(typed)
+
+            else:
+                # ── Normal mode ───────────────────────────────────────────────
+                delay_per_char = 1.0 / cps
+
+                for ch in text:
+                    if not self._check():
+                        self.status.emit("Stopped")
+                        self.finished.emit(False)
+                        return
+
+                    if ch in _SPECIAL:
+                        self._tap_special(ch)
+                    else:
+                        # Same reasoning as turbo: controller.type() is reliable
+                        # for spaces, punctuation, and any char needing modifiers.
+                        self.controller.type(ch)
+
+                    typed += 1
+
+                    delay = delay_per_char * random.uniform(0.90, 1.12)
                     if not self._sleep_interruptible(delay):
                         self.status.emit("Stopped")
                         self.finished.emit(False)
                         return
 
-                if typed % 50 == 0:
-                    self._emit_stats(typed)
+                    if typed % 50 == 0:
+                        self._emit_stats(typed)
 
             self._emit_stats(typed)
             self.status.emit("Done")
             self.finished.emit(True)
+
         except Exception as exc:
             self.status.emit(f"Error: {exc}")
             self.finished.emit(False)
